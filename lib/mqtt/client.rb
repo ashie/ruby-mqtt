@@ -165,7 +165,7 @@ module MQTT
       @read_queue = Queue.new
       @pubacks = {}
       @read_thread = nil
-      @write_semaphore = Mutex.new
+      @socket_semaphore = Mutex.new
       @pubacks_semaphore = Mutex.new
     end
 
@@ -227,7 +227,9 @@ module MQTT
 
       raise 'No MQTT server host set when attempting to connect' if @host.nil?
 
-      unless connected?
+      @socket_semaphore.synchronize do
+        break if connected?
+
         # Create network socket
         tcp_socket = TCPSocket.new(@host, @port)
 
@@ -290,21 +292,24 @@ module MQTT
       @read_thread.kill if @read_thread && @read_thread.alive?
       @read_thread = nil
 
-      return unless connected?
-
-      # Close the socket if it is open
-      if send_msg
-        packet = MQTT::Packet::Disconnect.new
-        send_packet(packet)
+      if @socket_semaphore.owned?
+        close_socket(send_msg)
+      else
+        @socket_semaphore.synchronize do
+          close_socket(send_msg)
+        end
       end
-      @socket.close unless @socket.nil?
-      handle_close
-      @socket = nil
     end
 
     # Checks whether the client is connected to the server.
     def connected?
-      !@socket.nil? && !@socket.closed?
+      if @socket_semaphore.owned?
+        !@socket.nil? && !@socket.closed?
+      else
+        @socket_semaphore.synchronize do
+          !@socket.nil? && !@socket.closed?
+        end
+      end
     end
 
     # Publish a message on a particular topic to the MQTT server.
@@ -460,18 +465,18 @@ module MQTT
       # Poll socket - is there data waiting?
       result = IO.select([@socket], [], [], SELECT_TIMEOUT)
       handle_timeouts
-      unless result.nil?
-        # Yes - read in the packet
-        packet = MQTT::Packet.read(@socket)
-        handle_packet packet
+      @socket_semaphore.synchronize do
+        unless result.nil?
+          # Yes - read in the packet
+          packet = MQTT::Packet.read(@socket)
+          handle_packet packet
+        end
+        keep_alive!
       end
-      keep_alive!
     # Pass exceptions up to parent thread
     rescue Exception => exp
-      unless @socket.nil?
-        @socket.close
-        @socket = nil
-        handle_close
+      @socket_semaphore.synchronize do
+        close_socket(false)
       end
       Thread.current[:parent].raise(exp)
     end
@@ -507,6 +512,19 @@ module MQTT
       @pubacks_semaphore.synchronize do
         @pubacks.each_value { |q| q << :close }
       end
+    end
+
+    def close_socket(send_msg = true)
+      return unless connected?
+
+      # Close the socket if it is open
+      if send_msg
+        packet = MQTT::Packet::Disconnect.new
+        send_packet(packet)
+      end
+      @socket.close unless @socket.nil?
+      handle_close
+      @socket = nil
     end
 
     if Process.const_defined? :CLOCK_MONOTONIC
@@ -557,12 +575,15 @@ module MQTT
 
     # Send a packet to server
     def send_packet(data)
-      # Raise exception if we aren't connected
-      raise MQTT::NotConnectedException unless connected?
-
       # Only allow one thread to write to socket at a time
-      @write_semaphore.synchronize do
+      if @socket_semaphore.owned?
+        raise MQTT::NotConnectedException unless connected?
         @socket.write(data.to_s)
+      else
+        @socket_semaphore.synchronize do
+          raise MQTT::NotConnectedException unless connected?
+          @socket.write(data.to_s)
+        end
       end
     end
 
